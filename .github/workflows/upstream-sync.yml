@@ -1,0 +1,69 @@
+name: Sync Upstream Stable
+
+on:
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional published stable tag, e.g. v1.4.1'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: upstream-stable-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'zzw6776/iroh'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ecopaste
+          fetch-depth: 0
+      - name: Prepare upstream release with the carry patch
+        id: update
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          args=()
+          if [[ -n "$REQUESTED_TAG" ]]; then args+=(--tag "$REQUESTED_TAG"); fi
+          python3 ecopaste/prepare_update.py "${args[@]}"
+      - name: Open validated automatic update
+        if: steps.update.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.update.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.update.outputs.upstream_sha }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          base="$(git rev-parse HEAD)"
+          branch="auto/upstream-${TAG}-${base:0:12}"
+          git add -A
+          tree="$(git write-tree)"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "$branch"
+            test "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$tree"
+          else
+            commit="$(git commit-tree "$tree" -p "$base" -p "$UPSTREAM_SHA" -m "chore: update upstream to ${TAG}")"
+            git push origin "${commit}:refs/heads/${branch}"
+          fi
+          printf 'Update to %s while retaining the GSO carry patch and regression checks.\n\nUpstream commit: `%s`.\n' "$TAG" "$UPSTREAM_SHA" > /tmp/update-body.md
+          pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$pr" ]]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base ecopaste --head "$branch" --title "chore: update upstream to ${TAG}" --body-file /tmp/update-body.md
+            pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number')"
+          fi
+          # GITHUB_TOKEN-created pushes/PRs do not trigger other workflows; dispatch is explicit.
+          gh workflow run fork-check.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --auto --merge

@@ -1,0 +1,194 @@
+diff --git a/iroh/src/socket/transports.rs b/iroh/src/socket/transports.rs
+index 4c72a57f42f..e58739f7a92 100644
+--- a/iroh/src/socket/transports.rs
++++ b/iroh/src/socket/transports.rs
+@@ -418,20 +418,8 @@ impl Transports {
+         self.ip.iter().map(|t| t.bind_addr()).collect()
+     }
+ 
+-    #[cfg(not(wasm_browser))]
+-    pub(crate) fn max_transmit_segments(&self) -> NonZeroUsize {
+-        let ip = self.ip.iter().map(|t| t.max_transmit_segments());
+-        let custom = self.custom.iter().map(|t| t.max_transmit_segments());
+-        ip.chain(custom).min().unwrap_or(NonZeroUsize::MIN)
+-    }
+-
+-    #[cfg(wasm_browser)]
+-    pub(crate) fn max_transmit_segments(&self) -> NonZeroUsize {
+-        self.custom
+-            .iter()
+-            .map(|t| t.max_transmit_segments())
+-            .min()
+-            .unwrap_or(NonZeroUsize::MIN)
++    fn custom_max_transmit_segments(&self) -> Option<NonZeroUsize> {
++        self.custom.iter().map(|t| t.max_transmit_segments()).min()
+     }
+ 
+     #[cfg(not(wasm_browser))]
+@@ -468,14 +456,14 @@ impl Transports {
+ 
+         let relay = self.relay.iter().map(|t| t.create_sender()).collect();
+         let custom = self.custom.iter().map(|t| t.create_sender()).collect();
+-        let max_transmit_segments = self.max_transmit_segments();
++        let custom_max_transmit_segments = self.custom_max_transmit_segments();
+ 
+         TransportsSender {
+             #[cfg(not(wasm_browser))]
+             ip,
+             relay,
+             custom,
+-            max_transmit_segments,
++            custom_max_transmit_segments,
+         }
+     }
+ 
+@@ -957,10 +945,23 @@ pub(crate) struct TransportsSender {
+     ip: IpTransportsSender,
+     relay: Vec<RelaySender>,
+     custom: Vec<Arc<dyn CustomSender>>,
+-    max_transmit_segments: NonZeroUsize,
++    custom_max_transmit_segments: Option<NonZeroUsize>,
+ }
+ 
+ impl TransportsSender {
++    /// The IP sockets' limit is read on each call: noq-udp lowers it after the kernel refuses a
++    /// segmented send.
++    fn max_transmit_segments(&self) -> NonZeroUsize {
++        #[cfg(not(wasm_browser))]
++        let ip = self.ip.max_transmit_segments();
++        #[cfg(wasm_browser)]
++        let ip = None;
++        ip.into_iter()
++            .chain(self.custom_max_transmit_segments)
++            .min()
++            .unwrap_or(NonZeroUsize::MIN)
++    }
++
+     #[instrument(name = "poll_send", skip(self, cx, transmit), fields(len = transmit.contents.len()))]
+     pub(crate) fn poll_send(
+         mut self: Pin<&mut Self>,
+@@ -1300,7 +1301,7 @@ impl noq::UdpSender for Sender {
+     }
+ 
+     fn max_transmit_segments(&self) -> NonZeroUsize {
+-        self.sender.max_transmit_segments
++        self.sender.max_transmit_segments()
+     }
+ }
+ 
+@@ -1332,7 +1333,7 @@ mod tests {
+                     .create_sender(),
+                 relay: vec![sender],
+                 custom: Vec::new(),
+-                max_transmit_segments: NonZeroUsize::new(1).unwrap(),
++                custom_max_transmit_segments: None,
+             };
+             (
+                 sender,
+@@ -1379,6 +1380,50 @@ mod tests {
+         );
+     }
+ 
++    #[cfg(target_os = "linux")]
++    #[tokio::test]
++    async fn open_senders_stop_batching_after_a_refused_segmented_send() {
++        // GIVEN: an open sender on a loopback socket that supports GSO.
++        let loopback = IpConfig::V4 {
++            ip_net: "127.0.0.1/8".parse().unwrap(),
++            port: 0,
++            is_required: true,
++            is_default: true,
++        };
++        let transports = Transports {
++            ip: IpTransports::bind(std::iter::once(loopback), &EndpointMetrics::default()).unwrap(),
++            relay: Vec::new(),
++            custom: Vec::new(),
++            poll_recv_counter: 0,
++            recv_infos: Default::default(),
++            consecutive_total_recv_failures: 0,
++        };
++        let mut sender = transports.create_sender();
++        // Without GSO the limit is already 1, so there is nothing to go stale.
++        if sender.max_transmit_segments() == NonZeroUsize::MIN {
++            return;
++        }
++        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
++
++        // WHEN: the kernel refuses a segmented send. More segments than `UDP_MAX_SEGMENTS` fail
++        // with EINVAL, which noq-udp handles like the EIO of a NIC without checksum offload.
++        let contents = [0u8; 1024];
++        let transmit = Transmit {
++            ecn: None,
++            contents: &contents,
++            segment_size: Some(1),
++        };
++        let path = FourTuple::Ip {
++            remote: receiver.local_addr().unwrap(),
++            local: None,
++        };
++        let _ =
++            std::future::poll_fn(|cx| Pin::new(&mut sender).poll_send(cx, &path, &transmit)).await;
++
++        // THEN: the sender stops batching.
++        assert_eq!(sender.max_transmit_segments(), NonZeroUsize::MIN);
++    }
++
+     fn custom_only_transports(custom: Vec<Box<dyn CustomEndpoint>>) -> Transports {
+         let metrics = EndpointMetrics::default();
+         Transports {
+diff --git a/iroh/src/socket/transports/ip.rs b/iroh/src/socket/transports/ip.rs
+index 4d78953dc6a..ffa830f2f3a 100644
+--- a/iroh/src/socket/transports/ip.rs
++++ b/iroh/src/socket/transports/ip.rs
+@@ -234,10 +234,6 @@ impl IpTransport {
+         self.local_addr.watch()
+     }
+ 
+-    pub(super) fn max_transmit_segments(&self) -> NonZeroUsize {
+-        self.socket.max_gso_segments()
+-    }
+-
+     pub(super) fn max_receive_segments(&self) -> NonZeroUsize {
+         self.socket.gro_segments()
+     }
+@@ -261,6 +257,7 @@ impl IpTransport {
+         let sender = self.socket.clone().create_sender();
+         IpSender {
+             config: self.config,
++            socket: self.socket.clone(),
+             sender,
+             metrics: self.metrics.clone(),
+         }
+@@ -293,12 +290,17 @@ impl IpNetworkChangeSender {
+ #[pin_project]
+ pub(super) struct IpSender {
+     config: Config,
++    socket: Arc<UdpSocket>,
+     #[pin]
+     sender: UdpSender,
+     metrics: Arc<SocketMetrics>,
+ }
+ 
+ impl IpSender {
++    pub(super) fn max_transmit_segments(&self) -> NonZeroUsize {
++        self.socket.max_gso_segments()
++    }
++
+     pub(super) fn is_valid_send_addr(&self, src: Option<IpAddr>, dst: &SocketAddr) -> bool {
+         self.config.is_valid_send_addr(src, *dst)
+     }
+@@ -365,6 +367,14 @@ pub(super) struct IpTransportsSender {
+ }
+ 
+ impl IpTransportsSender {
++    pub(super) fn max_transmit_segments(&self) -> Option<NonZeroUsize> {
++        self.v4
++            .iter()
++            .chain(&self.v6)
++            .map(IpSender::max_transmit_segments)
++            .min()
++    }
++
+     pub(super) fn v4_iter_mut(&mut self) -> impl Iterator<Item = &mut IpSender> {
+         self.v4.iter_mut()
+     }

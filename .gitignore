@@ -2,3 +2,6 @@
 /logs
 iroh.config.toml
 /.patchbay
+
+# Local Python update-tool bytecode.
+__pycache__/
