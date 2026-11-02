@@ -29,7 +29,7 @@ reapplies this overlay, and opens an update PR. Only this fork's workflows are
 installed: upstream publication and self-hosted workflows are excluded.
 
 The PR automatically merges only after the required `Fork validation` check
-passes on Linux, macOS and Windows. The GSO socket regression and overlay tests
+passes on Linux, macOS, Windows and an Android arm64 release compilation. The GSO socket regression and overlay tests
 must pass. `workflow_dispatch` starts these checks explicitly because a PR made
 with GITHUB_TOKEN does not itself start another workflow.
 
