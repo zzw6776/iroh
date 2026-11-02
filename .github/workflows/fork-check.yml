@@ -49,6 +49,15 @@ jobs:
         with:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
+      - name: Set up Java for Android command-line tools
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - name: Configure the Android NDK
         run: |
           sdkmanager 'ndk;29.0.14206865'

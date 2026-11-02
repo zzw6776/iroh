@@ -1,6 +1,5 @@
 """Exercise patch carry-forward and conflict handling against real upstream files."""
 import importlib.util
-import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,6 +7,8 @@ import tempfile
 import unittest
 
 FORK = Path(__file__).resolve().parents[2]
+# Freeze the pre-fix fixture; the tracked upstream revision may already contain the fix.
+UNFIXED_UPSTREAM = "d6c6963b9602d1b8dd2ba53b6519e7eb19cc7940"
 spec = importlib.util.spec_from_file_location("prepare_update", FORK / "ecopaste/prepare_update.py")
 update = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(update)
@@ -20,18 +21,21 @@ class UpstreamOverlayTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         shutil.copytree(FORK / "ecopaste", self.root / "ecopaste")
-        upstream = json.loads((FORK / "ecopaste/upstream.json").read_text())["revision"]
         for relative in ["iroh/src/socket/transports.rs", "iroh/src/socket/transports/ip.rs"]:
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(subprocess.check_output(["git", "-C", str(FORK), "show", f"{upstream}:{relative}"]))
+            path.write_bytes(subprocess.check_output(["git", "-C", str(FORK), "show", f"{UNFIXED_UPSTREAM}:{relative}"]))
 
-    def test_backport_then_upstream_integration_is_not_applied_twice(self):
+    def test_unfixed_upstream_receives_the_backport(self):
         self.assertEqual(update.apply_gso_patch(self.root), "backported")
+
+    def test_upstream_with_the_fix_is_not_patched_again(self):
+        patch = self.root / "ecopaste/patches/gso-live-limit.patch"
+        subprocess.run(["git", "-C", str(self.root), "apply", str(patch)], check=True)
         source = self.root / "iroh/src/socket/transports.rs"
-        once = source.read_bytes()
+        fixed = source.read_bytes()
         self.assertEqual(update.apply_gso_patch(self.root), "upstream")
-        self.assertEqual(source.read_bytes(), once)
+        self.assertEqual(source.read_bytes(), fixed)
 
     def test_conflicting_upstream_is_rejected_without_partial_patch(self):
         source = self.root / "iroh/src/socket/transports.rs"
