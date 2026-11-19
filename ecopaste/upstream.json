@@ -1,7 +1,7 @@
 {
   "repository": "n0-computer/iroh",
-  "tag": "v1.4.1",
-  "revision": "d6c6963b9602d1b8dd2ba53b6519e7eb19cc7940",
+  "tag": "v1.5.0",
+  "revision": "ea3bbb6ab41fa23816d7f9e3220ab77d444435b2",
   "major": 1,
   "gso_patch": "backported"
 }
